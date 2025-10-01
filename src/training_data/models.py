@@ -70,3 +70,71 @@ class JobCreateResponse(BaseModel):
     message: str = Field(
         default="Job created successfully. Processing will begin shortly."
     )
+
+
+class FeatureTemplate(BaseModel):
+    """Template for a feature in Elasticsearch."""
+
+    lang: str = Field(default="painless", description="Script language")
+    source: str = Field(description="Script source code")
+
+
+class Feature(BaseModel):
+    """A single feature definition for Elasticsearch featureset."""
+
+    name: str = Field(description="Name of the feature")
+    params: list = Field(default_factory=list, description="Feature parameters")
+    template_language: str = Field(
+        default="script_feature", description="Template language type"
+    )
+    template: FeatureTemplate = Field(description="Feature template configuration")
+
+
+class FeatureSetRequest(BaseModel):
+    """Request model for creating a featureset."""
+
+    features: list[Feature] = Field(
+        min_length=1, description="List of features for the featureset"
+    )
+
+
+class FeatureSetResponse(BaseModel):
+    """Response model for featureset creation."""
+
+    featureset_name: str = Field(description="Name of the created featureset")
+    features_count: int = Field(description="Number of features in the featureset")
+    message: str = Field(default="Featureset created successfully")
+    acknowledged: bool = Field(
+        default=True, description="Elasticsearch acknowledgment status"
+    )
+
+
+class FeatureExtractionRequest(BaseModel):
+    """Request model for extracting features from judgment list."""
+
+    judgment_list_filename: str = Field(
+        description="Name of the judgment list CSV file"
+    )
+    featureset_name: str = Field(description="Name of the featureset to use")
+
+
+class ProductFeatures(BaseModel):
+    """Features extracted for a single product."""
+
+    product_id: str = Field(description="Product ID")
+    features: list[dict] = Field(
+        default_factory=list, description="List of feature values"
+    )
+
+
+class FeatureExtractionResponse(BaseModel):
+    """Response model for feature extraction."""
+
+    featureset_name: str = Field(description="Name of the featureset used")
+    total_products: int = Field(description="Total number of products processed")
+    products_with_features: int = Field(
+        description="Number of products with extracted features"
+    )
+    product_features: list[ProductFeatures] = Field(
+        default_factory=list, description="Feature vectors for each product"
+    )

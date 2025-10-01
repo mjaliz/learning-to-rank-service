@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     )
     ELASTIC_PORT: int = Field(default=9200, description="Elasticsearch port")
     ELASTIC_INDEX: str = Field(default="", description="Elasticsearch index name")
+    ELASTIC_USER: str = Field(default="", description="Elasticsearch username")
+    ELASTIC_PASSWORD: str = Field(default="", description="Elasticsearch password")
 
     # File storage settings
     UPLOAD_DIR: str = Field(

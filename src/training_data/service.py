@@ -2,13 +2,16 @@
 Service layer for judgment list file creation and job management.
 """
 
+import asyncio
 import csv
 import io
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from uuid import UUID, uuid4
 
 import aiofiles
+from elasticsearch import Elasticsearch
 from fastapi import BackgroundTasks, UploadFile
 from loguru import logger
 from sqlalchemy import text
@@ -17,10 +20,15 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from src.config import settings
 from src.training_data.models import (
+    FeatureExtractionRequest,
+    FeatureExtractionResponse,
+    FeatureSetRequest,
+    FeatureSetResponse,
     JobCreateResponse,
     JobStatus,
     JobStatusResponse,
     JudgmentListJob,
+    ProductFeatures,
 )
 from src.training_data.repository import JudgmentListJobRepository
 
@@ -195,8 +203,9 @@ class JudgmentListService:
 
         logger.debug(f"Read SQL file with {len(sql_content)} characters")
 
-        # Create output filename
-        output_filename = original_filename.replace(".sql", "_judgment_list.csv")
+        # Create output filename with current timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = f"{timestamp}_judgment_list.csv"
         output_path = Path(settings.OUTPUT_DIR) / output_filename
 
         # Execute SQL and save results as CSV
@@ -262,3 +271,276 @@ class JudgmentListService:
             except Exception as e:
                 logger.error(f"Error executing SQL query or writing CSV: {str(e)}")
                 raise
+
+
+class FeatureSetService:
+    """Service for managing Elasticsearch featuresets."""
+
+    def __init__(self, es_client: Elasticsearch):
+        """
+        Initialize the service with an Elasticsearch client.
+
+        Args:
+            es_client: Elasticsearch client instance
+        """
+        self._es_client = es_client
+
+    async def create_featureset(
+        self, featureset_name: str, request: FeatureSetRequest
+    ) -> FeatureSetResponse:
+        """
+        Create a featureset in Elasticsearch Learning to Rank plugin.
+
+        Args:
+            featureset_name: Name of the featureset to create
+            request: Request containing features configuration
+
+        Returns:
+            Response with featureset creation status
+
+        Raises:
+            Exception: If featureset creation fails
+        """
+        try:
+            logger.info(
+                f"Creating featureset '{featureset_name}' with {len(request.features)} features"
+            )
+
+            # Build featureset body for Elasticsearch LTR plugin
+            featureset_body = {
+                "featureset": {
+                    "features": [
+                        {
+                            "name": feature.name,
+                            "params": feature.params,
+                            "template_language": feature.template_language,
+                            "template": {
+                                "lang": feature.template.lang,
+                                "source": feature.template.source,
+                            },
+                        }
+                        for feature in request.features
+                    ],
+                }
+            }
+
+            # Create featureset using Elasticsearch LTR API
+            # The endpoint is: PUT _ltr/_featureset/{featureset_name}
+            response = self._es_client.transport.perform_request(
+                method="PUT",
+                url=f"/_ltr/_featureset/{featureset_name}",
+                body=featureset_body,
+            )
+
+            logger.info(
+                f"Successfully created featureset '{featureset_name}'. Response: {response}"
+            )
+
+            return FeatureSetResponse(
+                featureset_name=featureset_name,
+                features_count=len(request.features),
+                acknowledged=response.get("acknowledged", True),
+            )
+
+        except Exception as e:
+            logger.error(f"Error creating featureset '{featureset_name}': {str(e)}")
+            raise
+
+    async def extract_features_from_judgment_list(
+        self, request: FeatureExtractionRequest
+    ) -> FeatureExtractionResponse:
+        """
+        Extract features for unique product IDs from a judgment list file.
+
+        Uses asyncio with semaphore to run 5 concurrent requests to Elasticsearch.
+
+        Args:
+            request: Request containing judgment list filename and featureset name
+
+        Returns:
+            Response with extracted features for each unique product
+
+        Raises:
+            FileNotFoundError: If judgment list file is not found
+            Exception: If feature extraction fails
+        """
+        try:
+            logger.info(
+                f"Extracting features using featureset '{request.featureset_name}' "
+                f"from judgment list '{request.judgment_list_filename}'"
+            )
+
+            # Construct full path to judgment list file
+            judgment_list_path = (
+                Path(settings.OUTPUT_DIR) / request.judgment_list_filename
+            )
+
+            if not judgment_list_path.exists():
+                raise FileNotFoundError(
+                    f"Judgment list file not found: {request.judgment_list_filename}"
+                )
+
+            # Read judgment list and extract unique product IDs
+            unique_product_ids = await self._extract_unique_product_ids(
+                judgment_list_path
+            )
+
+            logger.info(
+                f"Found {len(unique_product_ids)} unique product IDs in judgment list"
+            )
+
+            # Create batches ahead of time to avoid duplication due to concurrency
+            batch_size = 1000
+            batches = []
+            for i in range(0, len(unique_product_ids), batch_size):
+                batch_ids = unique_product_ids[i : i + batch_size]
+                batches.append(batch_ids)
+
+            logger.info(f"Created {len(batches)} batches for concurrent processing")
+
+            # Create semaphore to limit concurrent requests to 5
+            semaphore = asyncio.Semaphore(5)
+
+            # Create tasks for concurrent processing
+            async def process_batch_with_semaphore(
+                batch_ids: list[str], batch_number: int
+            ) -> list[ProductFeatures]:
+                """Process a single batch with semaphore control."""
+                async with semaphore:
+                    logger.debug(
+                        f"Processing batch {batch_number}/{len(batches)} "
+                        f"with {len(batch_ids)} product IDs"
+                    )
+                    return await self._extract_features_for_products(
+                        product_ids=batch_ids, featureset_name=request.featureset_name
+                    )
+
+            # Create all tasks
+            tasks = [
+                process_batch_with_semaphore(batch, idx + 1)
+                for idx, batch in enumerate(batches)
+            ]
+
+            # Execute all tasks concurrently with semaphore controlling concurrency
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Collect all successful results and log errors
+            all_product_features = []
+            for idx, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.error(f"Error processing batch {idx + 1}: {str(result)}")
+                else:
+                    all_product_features.extend(result)
+
+            logger.info(
+                f"Successfully extracted features for {len(all_product_features)} products"
+            )
+
+            return FeatureExtractionResponse(
+                featureset_name=request.featureset_name,
+                total_products=len(unique_product_ids),
+                products_with_features=len(all_product_features),
+                product_features=all_product_features,
+            )
+
+        except Exception as e:
+            logger.error(f"Error extracting features: {str(e)}")
+            raise
+
+    async def _extract_unique_product_ids(self, judgment_list_path: Path) -> list[str]:
+        """
+        Extract unique product IDs from a judgment list CSV file.
+
+        Args:
+            judgment_list_path: Path to the judgment list CSV file
+
+        Returns:
+            List of unique product IDs as strings
+
+        Raises:
+            Exception: If CSV reading fails
+        """
+        unique_ids = set()
+
+        async with aiofiles.open(judgment_list_path, "r", encoding="utf-8") as f:
+            content = await f.read()
+
+        # Parse CSV
+        csv_reader = csv.DictReader(io.StringIO(content))
+
+        for row in csv_reader:
+            if "product_id" in row and row["product_id"]:
+                unique_ids.add(str(row["product_id"]))
+
+        return list(unique_ids)
+
+    async def _extract_features_for_products(
+        self, product_ids: list[str], featureset_name: str
+    ) -> list[ProductFeatures]:
+        """
+        Extract features for a batch of product IDs using Elasticsearch LTR.
+
+        Uses asyncio.to_thread to run the synchronous Elasticsearch client in a thread.
+
+        Args:
+            product_ids: List of product IDs to extract features for
+            featureset_name: Name of the featureset to use
+
+        Returns:
+            List of ProductFeatures with extracted feature vectors
+
+        Raises:
+            Exception: If Elasticsearch query fails
+        """
+        # Build the Elasticsearch query with LTR logging
+        query_body = {
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"terms": {"id": product_ids}},
+                        {
+                            "sltr": {
+                                "_name": "logged_featureset",
+                                "featureset": featureset_name,
+                                "params": {},
+                            }
+                        },
+                    ]
+                }
+            },
+            "ext": {
+                "ltr_log": {
+                    "log_specs": {
+                        "name": "log_entry1",
+                        "named_query": "logged_featureset",
+                    }
+                }
+            },
+            "size": len(product_ids),
+        }
+
+        # Execute the query in a thread pool to avoid blocking
+        response = await asyncio.to_thread(
+            self._es_client.search, index="products", body=query_body
+        )
+
+        # Parse the response and extract features
+        product_features_list = []
+
+        for hit in response.get("hits", {}).get("hits", []):
+            product_id = hit.get("_source", {}).get("id")
+
+            # Extract LTR features from the response
+            ltr_log = hit.get("fields", {}).get("_ltrlog", [])
+
+            if ltr_log and len(ltr_log) > 0:
+                # Parse the LTR log entry
+                log_entry = ltr_log[0]
+                if "log_entry1" in log_entry:
+                    features = log_entry["log_entry1"]
+
+                    product_features_list.append(
+                        ProductFeatures(product_id=str(product_id), features=features)
+                    )
+
+        return product_features_list
