@@ -803,7 +803,10 @@ class FeatureSetService:
             merged_df["qid"] = merged_df["keyword"].map(keyword_to_qid)
 
             # Reorder columns to put qid first (standard for LTR data)
-            columns = ["qid"] + [col for col in merged_df.columns if col != "qid"]
+            feature_columns = list(featureset_df.columns)
+            columns = ["qid", "relevance_grade"] + [
+                col for col in feature_columns if col != "qid" and col != "product_id"
+            ]
             merged_df = merged_df[columns]
 
             # Create output filename with timestamp
@@ -816,7 +819,6 @@ class FeatureSetService:
             merged_df.to_csv(training_data_path, index=False)
 
             # Create fmap file for XGBoost training
-            feature_columns = list(merged_df.columns)
             await self._create_fmap_file(feature_columns, fmap_filename)
 
             logger.info(
@@ -871,8 +873,6 @@ class FeatureSetService:
         logger.info(f"Creating fmap file with {len(feature_names)} features")
 
         async with aiofiles.open(fmap_path, "w", encoding="utf-8") as f:
-            # Write feature mappings in XGBoost format
-            # Format: <feature_index> <feature_name> <feature_type>
             for i, feature_name in enumerate(feature_names):
                 await f.write(f"{i}\t{feature_name}\tq\n")
 
