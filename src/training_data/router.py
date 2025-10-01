@@ -19,8 +19,9 @@ from loguru import logger
 
 from src.training_data.dependencies import get_featureset_service, get_service
 from src.training_data.models import (
+    FeatureExtractionJobCreateResponse,
+    FeatureExtractionJobStatusResponse,
     FeatureExtractionRequest,
-    FeatureExtractionResponse,
     FeatureSetRequest,
     FeatureSetResponse,
     JobCreateResponse,
@@ -180,29 +181,31 @@ async def create_featureset(
 
 @router.post(
     "/featureset/extract-features",
-    response_model=FeatureExtractionResponse,
-    status_code=status.HTTP_200_OK,
+    response_model=FeatureExtractionJobCreateResponse,
+    status_code=status.HTTP_201_CREATED,
     summary="Extract features from judgment list",
-    description="Extract features for unique product IDs from a judgment list file using a specified featureset.",
+    description="Create a job to extract features for unique product IDs from a judgment list file using a specified featureset.",
 )
 async def extract_features(
+    background_tasks: BackgroundTasks,
     request: FeatureExtractionRequest = Body(
         ..., description="Feature extraction configuration"
     ),
     service: FeatureSetService = Depends(get_featureset_service),
-) -> FeatureExtractionResponse:
+) -> FeatureExtractionJobCreateResponse:
     """
-    Extract features for unique product IDs from a judgment list file.
+    Create a feature extraction job to extract features for unique product IDs.
 
     Args:
+        background_tasks: FastAPI background tasks
         request: Request body containing judgment list filename and featureset name
         service: Featureset service dependency
 
     Returns:
-        Feature extraction response with extracted features for all products
+        Job creation response with job ID and status
 
     Raises:
-        HTTPException: If file not found or feature extraction fails
+        HTTPException: If file not found or job creation fails
     """
     try:
         logger.info(
@@ -210,11 +213,11 @@ async def extract_features(
             f"from judgment list '{request.judgment_list_filename}'"
         )
 
-        response = await service.extract_features_from_judgment_list(request)
-
-        logger.info(
-            f"Successfully extracted features for {response.products_with_features}/{response.total_products} products"
+        response = await service.create_feature_extraction_job(
+            request, background_tasks
         )
+
+        logger.info(f"Created feature extraction job {response.job_id}")
         return response
 
     except FileNotFoundError as e:
@@ -224,8 +227,56 @@ async def extract_features(
             detail=str(e),
         )
     except Exception as e:
-        logger.error(f"Error extracting features: {str(e)}")
+        logger.error(f"Error creating feature extraction job: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to extract features: {str(e)}",
+            detail=f"Failed to create feature extraction job: {str(e)}",
+        )
+
+
+@router.get(
+    "/featureset/extract-features/status/{job_id}",
+    response_model=FeatureExtractionJobStatusResponse,
+    summary="Check feature extraction job status",
+    description="Check the status of a feature extraction job by its ID.",
+)
+async def get_feature_extraction_job_status(
+    job_id: UUID,
+    service: FeatureSetService = Depends(get_featureset_service),
+) -> FeatureExtractionJobStatusResponse:
+    """
+    Get the status of a feature extraction job.
+
+    Args:
+        job_id: The UUID of the job
+        service: Featureset service dependency
+
+    Returns:
+        Job status response with current status and details
+
+    Raises:
+        HTTPException: If job is not found
+    """
+    try:
+        logger.debug(f"Checking status for feature extraction job {job_id}")
+
+        job_status = await service.get_feature_extraction_job_status(job_id)
+
+        if not job_status:
+            logger.warning(f"Feature extraction job {job_id} not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Feature extraction job with ID {job_id} not found",
+            )
+
+        logger.debug(f"Feature extraction job {job_id} status: {job_status.status}")
+        return job_status
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrieving feature extraction job status: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve job status. Please try again later.",
         )

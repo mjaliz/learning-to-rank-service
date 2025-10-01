@@ -20,6 +20,9 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from src.config import settings
 from src.training_data.models import (
+    FeatureExtractionJob,
+    FeatureExtractionJobCreateResponse,
+    FeatureExtractionJobStatusResponse,
     FeatureExtractionRequest,
     FeatureExtractionResponse,
     FeatureSetRequest,
@@ -30,7 +33,10 @@ from src.training_data.models import (
     JudgmentListJob,
     ProductFeatures,
 )
-from src.training_data.repository import JudgmentListJobRepository
+from src.training_data.repository import (
+    FeatureExtractionJobRepository,
+    JudgmentListJobRepository,
+)
 
 
 class JudgmentListService:
@@ -274,16 +280,20 @@ class JudgmentListService:
 
 
 class FeatureSetService:
-    """Service for managing Elasticsearch featuresets."""
+    """Service for managing Elasticsearch featuresets and feature extraction."""
 
-    def __init__(self, es_client: Elasticsearch):
+    def __init__(
+        self, es_client: Elasticsearch, repository: FeatureExtractionJobRepository
+    ):
         """
-        Initialize the service with an Elasticsearch client.
+        Initialize the service with an Elasticsearch client and repository.
 
         Args:
             es_client: Elasticsearch client instance
+            repository: Repository for feature extraction job persistence
         """
         self._es_client = es_client
+        self._repository = repository
 
     async def create_featureset(
         self, featureset_name: str, request: FeatureSetRequest
@@ -346,8 +356,131 @@ class FeatureSetService:
             logger.error(f"Error creating featureset '{featureset_name}': {str(e)}")
             raise
 
-    async def extract_features_from_judgment_list(
-        self, request: FeatureExtractionRequest
+    async def create_feature_extraction_job(
+        self, request: FeatureExtractionRequest, background_tasks: BackgroundTasks
+    ) -> FeatureExtractionJobCreateResponse:
+        """
+        Create a feature extraction job and schedule background processing.
+
+        Args:
+            request: Request containing judgment list filename and featureset name
+            background_tasks: FastAPI background tasks for async processing
+
+        Returns:
+            Response with job ID and status
+
+        Raises:
+            FileNotFoundError: If judgment list file is not found
+        """
+        # Validate judgment list file exists
+        judgment_list_path = Path(settings.OUTPUT_DIR) / request.judgment_list_filename
+
+        if not judgment_list_path.exists():
+            raise FileNotFoundError(
+                f"Judgment list file not found: {request.judgment_list_filename}"
+            )
+
+        # Create job record
+        job = FeatureExtractionJob(
+            judgment_list_filename=request.judgment_list_filename,
+            featureset_name=request.featureset_name,
+            status=JobStatus.PENDING,
+        )
+        job = await self._repository.create(job)
+
+        # Schedule background processing
+        background_tasks.add_task(self._process_feature_extraction_job, job.id)
+        logger.info(f"Scheduled feature extraction job {job.id}")
+
+        return FeatureExtractionJobCreateResponse(
+            job_id=job.id,
+            judgment_list_filename=job.judgment_list_filename,
+            featureset_name=job.featureset_name,
+            status=job.status,
+        )
+
+    async def get_feature_extraction_job_status(
+        self, job_id: UUID
+    ) -> Optional[FeatureExtractionJobStatusResponse]:
+        """
+        Get the status of a feature extraction job.
+
+        Args:
+            job_id: The UUID of the job
+
+        Returns:
+            Job status response if found, None otherwise
+        """
+        job = await self._repository.get_by_id(job_id)
+        if not job:
+            return None
+
+        return FeatureExtractionJobStatusResponse(
+            job_id=job.id,
+            judgment_list_filename=job.judgment_list_filename,
+            featureset_name=job.featureset_name,
+            status=job.status,
+            output_file_path=job.output_file_path,
+            error_message=job.error_message,
+            total_products=job.total_products,
+            products_with_features=job.products_with_features,
+            created_at=job.created_at,
+            started_at=job.started_at,
+            completed_at=job.completed_at,
+        )
+
+    async def _process_feature_extraction_job(self, job_id: UUID) -> None:
+        """
+        Process a feature extraction job in the background.
+
+        Args:
+            job_id: The UUID of the job to process
+        """
+        try:
+            logger.info(f"Starting feature extraction for job {job_id}")
+
+            # Update status to processing
+            await self._repository.update_status(job_id, JobStatus.PROCESSING)
+
+            # Get job details
+            job = await self._repository.get_by_id(job_id)
+            if not job:
+                logger.error(f"Feature extraction job {job_id} not found")
+                return
+
+            # Extract features
+            result = await self._extract_features_from_judgment_list(
+                judgment_list_filename=job.judgment_list_filename,
+                featureset_name=job.featureset_name,
+            )
+
+            # Save results to CSV
+            output_path = await self._save_features_to_csv(
+                result, job.judgment_list_filename, job.featureset_name
+            )
+
+            # Update job as completed
+            await self._repository.update_status(
+                job_id,
+                JobStatus.COMPLETED,
+                output_file_path=str(output_path),
+                total_products=result.total_products,
+                products_with_features=result.products_with_features,
+            )
+
+            logger.info(
+                f"Successfully completed feature extraction job {job_id}. "
+                f"Extracted features for {result.products_with_features}/{result.total_products} products"
+            )
+
+        except Exception as e:
+            logger.error(f"Error processing feature extraction job {job_id}: {str(e)}")
+            await self._repository.update_status(
+                job_id, JobStatus.FAILED, error_message=str(e)
+            )
+
+    async def _extract_features_from_judgment_list(
+        self, judgment_list_filename: str, featureset_name: str
     ) -> FeatureExtractionResponse:
         """
         Extract features for unique product IDs from a judgment list file.
@@ -355,7 +488,8 @@ class FeatureSetService:
         Uses asyncio with semaphore to run 5 concurrent requests to Elasticsearch.
 
         Args:
-            request: Request containing judgment list filename and featureset name
+            judgment_list_filename: Name of the judgment list CSV file
+            featureset_name: Name of the featureset to use
 
         Returns:
             Response with extracted features for each unique product
@@ -366,18 +500,16 @@ class FeatureSetService:
         """
         try:
             logger.info(
-                f"Extracting features using featureset '{request.featureset_name}' "
-                f"from judgment list '{request.judgment_list_filename}'"
+                f"Extracting features using featureset '{featureset_name}' "
+                f"from judgment list '{judgment_list_filename}'"
             )
 
             # Construct full path to judgment list file
-            judgment_list_path = (
-                Path(settings.OUTPUT_DIR) / request.judgment_list_filename
-            )
+            judgment_list_path = Path(settings.OUTPUT_DIR) / judgment_list_filename
 
             if not judgment_list_path.exists():
                 raise FileNotFoundError(
-                    f"Judgment list file not found: {request.judgment_list_filename}"
+                    f"Judgment list file not found: {judgment_list_filename}"
                 )
 
             # Read judgment list and extract unique product IDs
@@ -412,7 +544,7 @@ class FeatureSetService:
                         f"with {len(batch_ids)} product IDs"
                     )
                     return await self._extract_features_for_products(
-                        product_ids=batch_ids, featureset_name=request.featureset_name
+                        product_ids=batch_ids, featureset_name=featureset_name
                     )
 
             # Create all tasks
@@ -437,7 +569,7 @@ class FeatureSetService:
             )
 
             return FeatureExtractionResponse(
-                featureset_name=request.featureset_name,
+                featureset_name=featureset_name,
                 total_products=len(unique_product_ids),
                 products_with_features=len(all_product_features),
                 product_features=all_product_features,
@@ -544,3 +676,62 @@ class FeatureSetService:
                     )
 
         return product_features_list
+
+    async def _save_features_to_csv(
+        self,
+        result: FeatureExtractionResponse,
+        judgment_list_filename: str,
+        featureset_name: str,
+    ) -> Path:
+        """
+        Save extracted features to a CSV file.
+
+        Args:
+            result: Feature extraction results
+            judgment_list_filename: Original judgment list filename
+            featureset_name: Name of the featureset used
+
+        Returns:
+            Path to the created CSV file
+        """
+        # Create output filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = f"{timestamp}_features_{featureset_name}.csv"
+        output_path = Path(settings.OUTPUT_DIR) / output_filename
+
+        logger.info(f"Saving features to CSV file: {output_path}")
+
+        # Prepare CSV data
+        async with aiofiles.open(output_path, "w", encoding="utf-8") as f:
+            output = io.StringIO()
+            writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
+
+            # Write header
+            if result.product_features:
+                # Extract feature names from first product
+                first_product = result.product_features[0]
+                feature_names = [
+                    feature.get("name", f"feature_{i + 1}")
+                    for i, feature in enumerate(first_product.features)
+                ]
+                header = ["product_id"] + feature_names
+                writer.writerow(header)
+
+                logger.debug(f"CSV header with feature names: {header}")
+
+                # Write data rows
+                for product_feature in result.product_features:
+                    row = [product_feature.product_id] + [
+                        feature.get("value", "") for feature in product_feature.features
+                    ]
+                    writer.writerow(row)
+
+            # Get the CSV content and write to file
+            csv_content = output.getvalue()
+            await f.write(csv_content)
+            output.close()
+
+        logger.info(
+            f"Successfully saved {len(result.product_features)} feature vectors to {output_path}"
+        )
+        return output_path

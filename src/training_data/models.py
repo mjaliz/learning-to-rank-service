@@ -138,3 +138,60 @@ class FeatureExtractionResponse(BaseModel):
     product_features: list[ProductFeatures] = Field(
         default_factory=list, description="Feature vectors for each product"
     )
+
+
+class FeatureExtractionJob(SQLModel, table=True):
+    """Database model for feature extraction jobs."""
+
+    __tablename__ = "feature_extraction_jobs"
+
+    id: UUID = SQLField(
+        default_factory=uuid4,
+        primary_key=True,
+        nullable=False,
+    )
+    judgment_list_filename: str = SQLField(nullable=False, index=True)
+    featureset_name: str = SQLField(nullable=False, index=True)
+    status: JobStatus = SQLField(default=JobStatus.PENDING, nullable=False, index=True)
+    output_file_path: Optional[str] = SQLField(default=None)
+    error_message: Optional[str] = SQLField(default=None)
+    total_products: Optional[int] = SQLField(default=None)
+    products_with_features: Optional[int] = SQLField(default=None)
+    created_at: datetime = SQLField(
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+        default_factory=datetime.utcnow,
+    )
+    started_at: Optional[datetime] = SQLField(
+        sa_column=Column(DateTime(timezone=True), nullable=True), default=None
+    )
+    completed_at: Optional[datetime] = SQLField(
+        sa_column=Column(DateTime(timezone=True), nullable=True), default=None
+    )
+
+
+class FeatureExtractionJobStatusResponse(BaseModel):
+    """Response model for feature extraction job status queries."""
+
+    job_id: UUID
+    judgment_list_filename: str
+    featureset_name: str
+    status: JobStatus
+    output_file_path: Optional[str] = None
+    error_message: Optional[str] = None
+    total_products: Optional[int] = None
+    products_with_features: Optional[int] = None
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+
+class FeatureExtractionJobCreateResponse(BaseModel):
+    """Response model for feature extraction job creation."""
+
+    job_id: UUID
+    judgment_list_filename: str
+    featureset_name: str
+    status: JobStatus
+    message: str = Field(
+        default="Feature extraction job created successfully. Processing will begin shortly."
+    )

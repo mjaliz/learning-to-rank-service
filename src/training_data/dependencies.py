@@ -12,7 +12,10 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from src.config import settings
 from src.database import app_engine, searchworker_engine
-from src.training_data.repository import JudgmentListJobRepository
+from src.training_data.repository import (
+    FeatureExtractionJobRepository,
+    JudgmentListJobRepository,
+)
 from src.training_data.service import FeatureSetService, JudgmentListService
 
 # Elasticsearch client singleton
@@ -68,6 +71,21 @@ async def get_repository(
     return JudgmentListJobRepository(session)
 
 
+async def get_feature_extraction_repository(
+    session: AsyncSession = Depends(get_session),
+) -> FeatureExtractionJobRepository:
+    """
+    Dependency to get feature extraction job repository.
+
+    Args:
+        session: Database session from get_session dependency
+
+    Returns:
+        Repository instance
+    """
+    return FeatureExtractionJobRepository(session)
+
+
 async def get_service(
     repository: JudgmentListJobRepository = Depends(get_repository),
     searchworker_engine: AsyncEngine = Depends(get_searchworker_engine),
@@ -120,16 +138,20 @@ def get_elasticsearch_client() -> Elasticsearch:
     return _es_client
 
 
-def get_featureset_service(
+async def get_featureset_service(
     es_client: Elasticsearch = Depends(get_elasticsearch_client),
+    repository: FeatureExtractionJobRepository = Depends(
+        get_feature_extraction_repository
+    ),
 ) -> FeatureSetService:
     """
     Dependency to get featureset service.
 
     Args:
         es_client: Elasticsearch client from get_elasticsearch_client dependency
+        repository: Feature extraction job repository from get_feature_extraction_repository dependency
 
     Returns:
         FeatureSetService instance
     """
-    return FeatureSetService(es_client)
+    return FeatureSetService(es_client, repository)
