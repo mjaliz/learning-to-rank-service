@@ -1,0 +1,19 @@
+[project]
+name = "learning-to-rank-service"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic-settings>=2.0.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "loguru>=0.7.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "aiofiles>=24.0.0",
+    "python-multipart>=0.0.9",
+    "sqlmodel>=0.0.22",
+    "asyncpg>=0.29.0",
+    "greenlet>=3.2.4",
+]
