@@ -195,3 +195,28 @@ class FeatureExtractionJobCreateResponse(BaseModel):
     message: str = Field(
         default="Feature extraction job created successfully. Processing will begin shortly."
     )
+
+
+class TrainingDataMergeRequest(BaseModel):
+    """Request model for merging judgment list with featureset to create training data."""
+
+    judgment_list_filename: str = Field(
+        description="Name of the judgment list CSV file"
+    )
+    featureset_filename: str = Field(description="Name of the featureset CSV file")
+
+
+class TrainingDataMergeResponse(BaseModel):
+    """Response model for training data merge operation."""
+
+    judgment_list_filename: str = Field(
+        description="Name of the judgment list file used"
+    )
+    featureset_filename: str = Field(description="Name of the featureset file used")
+    training_data_filename: str = Field(
+        description="Name of the created training data file"
+    )
+    fmap_filename: str = Field(description="Name of the created fmap.txt file")
+    total_records: int = Field(description="Total number of records in training data")
+    merged_records: int = Field(description="Number of records successfully merged")
+    message: str = Field(default="Training data created successfully")

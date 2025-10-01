@@ -11,6 +11,7 @@ from typing import Optional
 from uuid import UUID, uuid4
 
 import aiofiles
+import pandas as pd
 from elasticsearch import Elasticsearch
 from fastapi import BackgroundTasks, UploadFile
 from loguru import logger
@@ -32,6 +33,8 @@ from src.training_data.models import (
     JobStatusResponse,
     JudgmentListJob,
     ProductFeatures,
+    TrainingDataMergeRequest,
+    TrainingDataMergeResponse,
 )
 from src.training_data.repository import (
     FeatureExtractionJobRepository,
@@ -735,3 +738,142 @@ class FeatureSetService:
             f"Successfully saved {len(result.product_features)} feature vectors to {output_path}"
         )
         return output_path
+
+    async def merge_featureset_with_judgment_list(
+        self, request: TrainingDataMergeRequest
+    ) -> TrainingDataMergeResponse:
+        """
+        Merge featureset file with judgment list file and save to CSV.
+
+        Args:
+            request: Request containing judgment list and featureset filenames
+
+        Returns:
+            Response with the saved filename
+
+        Raises:
+            FileNotFoundError: If either file is not found
+            Exception: If merge operation fails
+        """
+        try:
+            logger.info(
+                f"Merging featureset file '{request.featureset_filename}' "
+                f"with judgment list file '{request.judgment_list_filename}'"
+            )
+
+            # Construct full paths to files
+            judgment_list_path = (
+                Path(settings.OUTPUT_DIR) / request.judgment_list_filename
+            )
+            featureset_path = Path(settings.OUTPUT_DIR) / request.featureset_filename
+
+            # Validate files exist
+            if not judgment_list_path.exists():
+                raise FileNotFoundError(
+                    f"Judgment list file not found: {request.judgment_list_filename}"
+                )
+            if not featureset_path.exists():
+                raise FileNotFoundError(
+                    f"Featureset file not found: {request.featureset_filename}"
+                )
+
+            # Read CSV files using pandas
+            judgment_list_df = pd.read_csv(judgment_list_path)
+            featureset_df = pd.read_csv(featureset_path)
+
+            # Merge dataframes on product_id
+            merged_df = pd.merge(
+                judgment_list_df,
+                featureset_df,
+                on="product_id",
+                how="inner",
+            )
+
+            # Filter out records with keywords shorter than 2 characters
+            merged_df = merged_df[merged_df["keyword"].str.len() >= 2]
+
+            # Add qid column for LTR training data
+            # Create a mapping of unique keywords to query IDs
+            unique_keywords = merged_df["keyword"].unique()
+            keyword_to_qid = {
+                keyword: idx + 1 for idx, keyword in enumerate(unique_keywords)
+            }
+
+            # Assign qid to each row based on keyword
+            merged_df["qid"] = merged_df["keyword"].map(keyword_to_qid)
+
+            # Reorder columns to put qid first (standard for LTR data)
+            columns = ["qid"] + [col for col in merged_df.columns if col != "qid"]
+            merged_df = merged_df[columns]
+
+            # Create output filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            training_data_filename = f"{timestamp}_training_data.csv"
+            fmap_filename = f"{timestamp}_fmap.txt"
+
+            # Save training data CSV
+            training_data_path = Path(settings.OUTPUT_DIR) / training_data_filename
+            merged_df.to_csv(training_data_path, index=False)
+
+            # Create fmap file for XGBoost training
+            feature_columns = list(merged_df.columns)
+            await self._create_fmap_file(feature_columns, fmap_filename)
+
+            logger.info(
+                f"Successfully created training data: {training_data_filename} "
+                f"and fmap file: {fmap_filename} "
+                f"with {len(unique_keywords)} unique queries and {len(merged_df)} total records "
+                f"(filtered for keywords with at least 2 characters)"
+            )
+
+            return TrainingDataMergeResponse(
+                judgment_list_filename=request.judgment_list_filename,
+                featureset_filename=request.featureset_filename,
+                training_data_filename=training_data_filename,
+                fmap_filename=fmap_filename,
+                total_records=len(judgment_list_df),
+                merged_records=len(merged_df),
+                message="Training data created successfully",
+            )
+
+        except Exception as e:
+            logger.error(f"Error merging featureset with judgment list: {str(e)}")
+            raise
+
+    async def _create_fmap_file(
+        self, feature_columns: list[str], fmap_filename: str
+    ) -> None:
+        """
+        Create an fmap.txt file with feature names and their types.
+
+        Args:
+            feature_columns: List of feature column names (excluding product_id)
+            fmap_filename: Name of the fmap file to create
+        """
+        fmap_path = Path(settings.OUTPUT_DIR) / fmap_filename
+
+        # Filter out non-feature columns (like product_id, keyword, etc.)
+        feature_names = [
+            col
+            for col in feature_columns
+            if col
+            not in [
+                "qid",
+                "product_id",
+                "keyword",
+                "total_impressions",
+                "total_clicks",
+                "ctr",
+                "relevance_grade",
+            ]
+        ]
+
+        logger.info(f"Creating fmap file with {len(feature_names)} features")
+
+        async with aiofiles.open(fmap_path, "w", encoding="utf-8") as f:
+            # Write feature mappings in XGBoost format
+            # Format: <feature_index> <feature_name> <feature_type>
+            for i, feature_name in enumerate(feature_names):
+                await f.write(f"{i}\t{feature_name}\tq\n")
+
+        logger.info(f"Successfully created fmap file: {fmap_filename}")

@@ -26,6 +26,8 @@ from src.training_data.models import (
     FeatureSetResponse,
     JobCreateResponse,
     JobStatusResponse,
+    TrainingDataMergeRequest,
+    TrainingDataMergeResponse,
 )
 from src.training_data.service import FeatureSetService, JudgmentListService
 
@@ -279,4 +281,58 @@ async def get_feature_extraction_job_status(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve job status. Please try again later.",
+        )
+
+
+@router.post(
+    "/training-data/merge",
+    response_model=TrainingDataMergeResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Merge featureset with judgment list to create training data",
+    description="Merge a featureset CSV file with a judgment list CSV file to create training data.",
+)
+async def merge_training_data(
+    request: TrainingDataMergeRequest = Body(
+        ..., description="Training data merge configuration"
+    ),
+    service: FeatureSetService = Depends(get_featureset_service),
+) -> TrainingDataMergeResponse:
+    """
+    Merge featureset file with judgment list file to create training data.
+
+    Args:
+        request: Request body containing judgment list and featureset filenames
+        service: Featureset service dependency
+
+    Returns:
+        Response with training data creation status and file information
+
+    Raises:
+        HTTPException: If files not found or merge operation fails
+    """
+    try:
+        logger.info(
+            f"Received request to merge featureset '{request.featureset_filename}' "
+            f"with judgment list '{request.judgment_list_filename}'"
+        )
+
+        response = await service.merge_featureset_with_judgment_list(request)
+
+        logger.info(
+            f"Successfully merged training data: {response.training_data_filename} "
+            f"with {response.merged_records}/{response.total_records} records"
+        )
+        return response
+
+    except FileNotFoundError as e:
+        logger.warning(f"File not found: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        )
+    except Exception as e:
+        logger.error(f"Error merging training data: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to merge training data: {str(e)}",
         )
