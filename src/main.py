@@ -9,6 +9,7 @@ from sqlmodel import SQLModel
 
 from src.config import settings
 from src.database import app_engine, searchworker_engine
+from src.train.router import router as train_router
 from src.training_data.router import router as training_data_router
 
 
@@ -55,6 +56,7 @@ app = FastAPI(
 
 # Include routers
 app.include_router(training_data_router)
+app.include_router(train_router)
 
 
 @app.get("/", tags=["health"])
