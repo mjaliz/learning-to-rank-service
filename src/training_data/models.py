@@ -4,7 +4,7 @@ Data models for training data processing jobs.
 
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional, Union
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
@@ -72,22 +72,31 @@ class JobCreateResponse(BaseModel):
     )
 
 
-class FeatureTemplate(BaseModel):
-    """Template for a feature in Elasticsearch."""
+class ScriptFeatureTemplate(BaseModel):
+    """Script-based feature template for Elasticsearch."""
 
     lang: str = Field(default="painless", description="Script language")
     source: str = Field(description="Script source code")
+
+
+class MustacheFeatureTemplate(BaseModel):
+    """Mustache-based feature template for Elasticsearch."""
+
+    match: dict[str, str] = Field(description="Match query template")
+
+
+FeatureTemplate = Union[ScriptFeatureTemplate, MustacheFeatureTemplate, dict[str, Any]]
 
 
 class Feature(BaseModel):
     """A single feature definition for Elasticsearch featureset."""
 
     name: str = Field(description="Name of the feature")
-    params: list = Field(default_factory=list, description="Feature parameters")
+    params: list[str] = Field(default_factory=list, description="Feature parameters")
     template_language: str = Field(
         default="script_feature", description="Template language type"
     )
-    template: FeatureTemplate = Field(description="Feature template configuration")
+    template: dict[str, Any] = Field(description="Feature template configuration")
 
 
 class FeatureSetRequest(BaseModel):
@@ -122,6 +131,7 @@ class ProductFeatures(BaseModel):
     """Features extracted for a single product."""
 
     product_id: str = Field(description="Product ID")
+    keyword: str = Field(description="Keyword associated with this product")
     features: list[dict] = Field(
         default_factory=list, description="List of feature values"
     )

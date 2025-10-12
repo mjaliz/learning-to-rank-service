@@ -327,10 +327,7 @@ class FeatureSetService:
                             "name": feature.name,
                             "params": feature.params,
                             "template_language": feature.template_language,
-                            "template": {
-                                "lang": feature.template.lang,
-                                "source": feature.template.source,
-                            },
+                            "template": feature.template,
                         }
                         for feature in request.features
                     ],
@@ -486,16 +483,17 @@ class FeatureSetService:
         self, judgment_list_filename: str, featureset_name: str
     ) -> FeatureExtractionResponse:
         """
-        Extract features for unique product IDs from a judgment list file.
+        Extract features for product IDs grouped by keywords from a judgment list file.
 
         Uses asyncio with semaphore to run 5 concurrent requests to Elasticsearch.
+        Each request includes the keyword in the params for context-aware feature extraction.
 
         Args:
             judgment_list_filename: Name of the judgment list CSV file
             featureset_name: Name of the featureset to use
 
         Returns:
-            Response with extracted features for each unique product
+            Response with extracted features for each product grouped by keywords
 
         Raises:
             FileNotFoundError: If judgment list file is not found
@@ -515,45 +513,57 @@ class FeatureSetService:
                     f"Judgment list file not found: {judgment_list_filename}"
                 )
 
-            # Read judgment list and extract unique product IDs
-            unique_product_ids = await self._extract_unique_product_ids(
+            # Group products by keywords from judgment list
+            keyword_products = await self._group_products_by_keywords(
                 judgment_list_path
             )
 
+            # Calculate total unique products across all keywords
+            all_product_ids = set()
+            for product_ids in keyword_products.values():
+                all_product_ids.update(product_ids)
+            total_unique_products = len(all_product_ids)
+
             logger.info(
-                f"Found {len(unique_product_ids)} unique product IDs in judgment list"
+                f"Found {len(keyword_products)} keywords with {total_unique_products} unique products"
             )
 
-            # Create batches ahead of time to avoid duplication due to concurrency
+            # Create batches for each keyword group
             batch_size = 1000
-            batches = []
-            for i in range(0, len(unique_product_ids), batch_size):
-                batch_ids = unique_product_ids[i : i + batch_size]
-                batches.append(batch_ids)
+            keyword_batches = []
+            for keyword, product_ids in keyword_products.items():
+                # Split product IDs for this keyword into batches
+                for i in range(0, len(product_ids), batch_size):
+                    batch_ids = product_ids[i : i + batch_size]
+                    keyword_batches.append((keyword, batch_ids))
 
-            logger.info(f"Created {len(batches)} batches for concurrent processing")
+            logger.info(
+                f"Created {len(keyword_batches)} batches for concurrent processing"
+            )
 
             # Create semaphore to limit concurrent requests to 5
             semaphore = asyncio.Semaphore(5)
 
             # Create tasks for concurrent processing
             async def process_batch_with_semaphore(
-                batch_ids: list[str], batch_number: int
+                keyword: str, batch_ids: list[str], batch_number: int
             ) -> list[ProductFeatures]:
                 """Process a single batch with semaphore control."""
                 async with semaphore:
                     logger.debug(
-                        f"Processing batch {batch_number}/{len(batches)} "
-                        f"with {len(batch_ids)} product IDs"
+                        f"Processing batch {batch_number}/{len(keyword_batches)} "
+                        f"for keyword '{keyword}' with {len(batch_ids)} product IDs"
                     )
                     return await self._extract_features_for_products(
-                        product_ids=batch_ids, featureset_name=featureset_name
+                        product_ids=batch_ids,
+                        featureset_name=featureset_name,
+                        keyword=keyword,
                     )
 
             # Create all tasks
             tasks = [
-                process_batch_with_semaphore(batch, idx + 1)
-                for idx, batch in enumerate(batches)
+                process_batch_with_semaphore(keyword, batch_ids, idx + 1)
+                for idx, (keyword, batch_ids) in enumerate(keyword_batches)
             ]
 
             # Execute all tasks concurrently with semaphore controlling concurrency
@@ -573,7 +583,7 @@ class FeatureSetService:
 
             return FeatureExtractionResponse(
                 featureset_name=featureset_name,
-                total_products=len(unique_product_ids),
+                total_products=total_unique_products,
                 products_with_features=len(all_product_features),
                 product_features=all_product_features,
             )
@@ -609,8 +619,58 @@ class FeatureSetService:
 
         return list(unique_ids)
 
+    async def _group_products_by_keywords(
+        self, judgment_list_path: Path
+    ) -> dict[str, list[str]]:
+        """
+        Group product IDs by keywords from a judgment list CSV file.
+
+        Args:
+            judgment_list_path: Path to the judgment list CSV file
+
+        Returns:
+            Dictionary mapping keywords to lists of product IDs
+
+        Raises:
+            Exception: If CSV reading fails
+        """
+        keyword_products = {}
+
+        async with aiofiles.open(judgment_list_path, "r", encoding="utf-8") as f:
+            content = await f.read()
+
+        # Parse CSV
+        csv_reader = csv.DictReader(io.StringIO(content))
+
+        for row in csv_reader:
+            if (
+                "product_id" in row
+                and row["product_id"]
+                and "keyword" in row
+                and row["keyword"]
+            ):
+                keyword = str(row["keyword"]).strip()
+                product_id = str(row["product_id"])
+
+                # Skip empty keywords, single characters, and special characters
+                if not keyword or len(keyword) < 2 or keyword in [".", "‌", " ", ""]:
+                    continue
+
+                # Normalize keyword (convert to lowercase for consistency)
+                keyword = keyword.lower()
+
+                if keyword not in keyword_products:
+                    keyword_products[keyword] = []
+
+                # Avoid duplicates
+                if product_id not in keyword_products[keyword]:
+                    keyword_products[keyword].append(product_id)
+
+        logger.info(f"Grouped products by {len(keyword_products)} unique keywords")
+        return keyword_products
+
     async def _extract_features_for_products(
-        self, product_ids: list[str], featureset_name: str
+        self, product_ids: list[str], featureset_name: str, keyword: str
     ) -> list[ProductFeatures]:
         """
         Extract features for a batch of product IDs using Elasticsearch LTR.
@@ -620,6 +680,7 @@ class FeatureSetService:
         Args:
             product_ids: List of product IDs to extract features for
             featureset_name: Name of the featureset to use
+            keyword: The keyword associated with these product IDs
 
         Returns:
             List of ProductFeatures with extracted feature vectors
@@ -637,7 +698,7 @@ class FeatureSetService:
                             "sltr": {
                                 "_name": "logged_featureset",
                                 "featureset": featureset_name,
-                                "params": {},
+                                "params": {"keywords": keyword},
                             }
                         },
                     ]
@@ -675,7 +736,11 @@ class FeatureSetService:
                     features = log_entry["log_entry1"]
 
                     product_features_list.append(
-                        ProductFeatures(product_id=str(product_id), features=features)
+                        ProductFeatures(
+                            product_id=str(product_id),
+                            keyword=keyword,
+                            features=features,
+                        )
                     )
 
         return product_features_list
@@ -717,14 +782,14 @@ class FeatureSetService:
                     feature.get("name", f"feature_{i + 1}")
                     for i, feature in enumerate(first_product.features)
                 ]
-                header = ["product_id"] + feature_names
+                header = ["product_id", "keyword"] + feature_names
                 writer.writerow(header)
 
                 logger.debug(f"CSV header with feature names: {header}")
 
                 # Write data rows
                 for product_feature in result.product_features:
-                    row = [product_feature.product_id] + [
+                    row = [product_feature.product_id, product_feature.keyword] + [
                         feature.get("value", "") for feature in product_feature.features
                     ]
                     writer.writerow(row)
@@ -780,14 +845,11 @@ class FeatureSetService:
             # Read CSV files using pandas
             judgment_list_df = pd.read_csv(judgment_list_path)
             featureset_df = pd.read_csv(featureset_path)
+            featureset_df.drop(columns=["keyword"], inplace=True)
+            featureset_df["title_bm25"].fillna(0, inplace=True)
 
             # Merge dataframes on product_id
-            merged_df = pd.merge(
-                judgment_list_df,
-                featureset_df,
-                on="product_id",
-                how="inner",
-            )
+            merged_df = judgment_list_df.merge(featureset_df)
 
             # Filter out records with keywords shorter than 2 characters
             merged_df = merged_df[merged_df["keyword"].str.len() >= 2]

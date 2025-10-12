@@ -102,7 +102,7 @@ class TrainingRepository:
         """
         # Generate model filename
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        model_filename = f"{model_name}_{timestamp}_{training_id}.json"
+        model_filename = f"{model_name}_{timestamp}.json"
         model_path = self.models_dir / model_filename
 
         # Get the feature map file path

@@ -191,7 +191,7 @@ class TrainingService:
                 lambdarank_num_pair_per_sample=8,
                 objective="rank:ndcg",
                 eval_metric=["ndcg@1", "ndcg@10", "ndcg@20"],
-                early_stopping_rounds=20,
+                early_stopping_rounds=40,
             )
 
             # Update progress
@@ -530,6 +530,7 @@ class TrainingService:
         Returns:
             Dictionary containing the model payload
         """
+        model_name = model_name.replace(".json", "")
         return {
             "model": {
                 "name": model_name,
