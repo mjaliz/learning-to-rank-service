@@ -181,10 +181,13 @@ class TrainingService:
 
             # Create XGBRanker model
             model = XGBRanker(
-                # max_depth=request.max_depth,
-                # learning_rate=request.learning_rate,
-                # n_estimators=request.n_estimators,
-                # random_state=request.random_state,
+                max_depth=6,  # Control tree depth
+                learning_rate=0.05,  # Slower learning = better generalization
+                n_estimators=500,  # More trees for complex patterns
+                random_state=42,  # Reproducibility
+                min_child_weight=3,  # Regularization
+                subsample=0.8,  # Random sampling
+                colsample_bytree=0.8,  # Feature sampling
                 tree_method="hist",
                 device="cpu",
                 lambdarank_pair_method="topk",

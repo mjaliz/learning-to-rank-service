@@ -11,6 +11,7 @@ from typing import Optional
 from uuid import UUID, uuid4
 
 import aiofiles
+import numpy as np
 import pandas as pd
 from elasticsearch import Elasticsearch
 from fastapi import BackgroundTasks, UploadFile
@@ -843,16 +844,73 @@ class FeatureSetService:
                 )
 
             # Read CSV files using pandas
+            logger.info("Reading judgment list and featureset files...")
             judgment_list_df = pd.read_csv(judgment_list_path)
             featureset_df = pd.read_csv(featureset_path)
-            featureset_df.drop(columns=["keyword"], inplace=True)
-            featureset_df["title_bm25"].fillna(0, inplace=True)
 
-            # Merge dataframes on product_id
-            merged_df = judgment_list_df.merge(featureset_df)
+            logger.info(
+                f"Loaded {len(judgment_list_df):,} judgment records and "
+                f"{len(featureset_df):,} feature records"
+            )
+
+            # Fill NaN values in all numeric columns of featureset
+            # Do this BEFORE merging (don't drop keyword yet!)
+            numeric_columns = featureset_df.select_dtypes(include=[np.number]).columns
+            featureset_df[numeric_columns] = featureset_df[numeric_columns].fillna(0)
+            logger.info(f"Filled NaN values in {len(numeric_columns)} numeric feature columns")
+
+            # Merge dataframes on BOTH product_id AND keyword
+            # This ensures features match the correct keyword context
+            # Important: Don't drop keyword before merging!
+            merged_df = judgment_list_df.merge(
+                featureset_df,
+                on=["product_id", "keyword"],
+                how="inner",  # Only keep records that exist in both files
+                indicator=True,  # Track merge results for validation
+            )
+
+            # Validate merge results
+            original_count = len(judgment_list_df)
+            matched_count = (merged_df["_merge"] == "both").sum()
+            lost_count = original_count - matched_count
+
+            if lost_count > 0:
+                logger.warning(
+                    f"Merge results: {matched_count:,} matched, {lost_count:,} lost "
+                    f"({lost_count/original_count*100:.1f}% data loss)"
+                )
+
+                if lost_count / original_count > 0.1:  # More than 10% loss
+                    logger.error(
+                        "HIGH DATA LOSS during merge! "
+                        "Check that feature extraction covered all products."
+                    )
+
+            # Drop the merge indicator column
+            merged_df = merged_df.drop(columns=["_merge"])
 
             # Filter out records with keywords shorter than 2 characters
+            before_filter = len(merged_df)
             merged_df = merged_df[merged_df["keyword"].str.len() >= 2]
+            filtered_count = before_filter - len(merged_df)
+
+            if filtered_count > 0:
+                logger.info(
+                    f"Filtered out {filtered_count:,} records with keywords <2 characters"
+                )
+
+            # Check for and remove any duplicate (keyword, product_id) pairs
+            # This can happen if there are duplicates in either input file
+            before_dedup = len(merged_df)
+            merged_df = merged_df.drop_duplicates(
+                subset=["keyword", "product_id"], keep="first"
+            )
+            dedup_count = before_dedup - len(merged_df)
+
+            if dedup_count > 0:
+                logger.warning(
+                    f"Removed {dedup_count:,} duplicate keyword-product pairs from merged data"
+                )
 
             # Add qid column for LTR training data
             # Create a mapping of unique keywords to query IDs
@@ -864,11 +922,46 @@ class FeatureSetService:
             # Assign qid to each row based on keyword
             merged_df["qid"] = merged_df["keyword"].map(keyword_to_qid)
 
-            # Reorder columns to put qid first (standard for LTR data)
-            feature_columns = list(featureset_df.columns)
-            columns = ["qid", "relevance_grade"] + [
-                col for col in feature_columns if col != "qid" and col != "product_id"
+            logger.info(
+                f"Assigned {len(unique_keywords):,} unique query IDs (qid) for keywords"
+            )
+
+            # Define which columns should be excluded from training features
+            # Exclude metadata AND data leakage columns
+            exclude_from_features = [
+                # Metadata columns
+                "keyword",  # Metadata - qid represents this
+                "product_id",  # Metadata - not a ranking feature
+                # Data leakage columns (used to calculate relevance_grade)
+                "total_impressions",  # Data leakage - directly related to label
+                "total_clicks",  # Data leakage - directly related to label
+                "ctr",  # DATA LEAKAGE - this was used to create relevance_grade!
             ]
+
+            # Get all columns from merged dataframe
+            all_columns = merged_df.columns.tolist()
+
+            # Build feature column list (everything except qid, relevance_grade, and excluded columns)
+            feature_columns = [
+                col
+                for col in all_columns
+                if col not in exclude_from_features + ["qid", "relevance_grade"]
+            ]
+
+            # Log which columns were excluded
+            excluded_found = [col for col in all_columns if col in exclude_from_features]
+            if excluded_found:
+                logger.info(
+                    f"Excluded {len(excluded_found)} columns to prevent data leakage: {excluded_found}"
+                )
+
+            logger.info(
+                f"Training data will include {len(feature_columns)} features: {feature_columns}"
+            )
+
+            # Reorder columns: qid first, then relevance_grade, then all features
+            # This is the standard format for LTR training data
+            columns = ["qid", "relevance_grade"] + feature_columns
             merged_df = merged_df[columns]
 
             # Create output filename with timestamp
@@ -880,14 +973,15 @@ class FeatureSetService:
             training_data_path = Path(settings.OUTPUT_DIR) / training_data_filename
             merged_df.to_csv(training_data_path, index=False)
 
+            logger.info(f"Saved training data to {training_data_path}")
+
             # Create fmap file for XGBoost training
             await self._create_fmap_file(feature_columns, fmap_filename)
 
             logger.info(
                 f"Successfully created training data: {training_data_filename} "
                 f"and fmap file: {fmap_filename} "
-                f"with {len(unique_keywords)} unique queries and {len(merged_df)} total records "
-                f"(filtered for keywords with at least 2 characters)"
+                f"with {len(unique_keywords):,} unique queries and {len(merged_df):,} total records"
             )
 
             return TrainingDataMergeResponse(
@@ -895,7 +989,7 @@ class FeatureSetService:
                 featureset_filename=request.featureset_filename,
                 training_data_filename=training_data_filename,
                 fmap_filename=fmap_filename,
-                total_records=len(judgment_list_df),
+                total_records=original_count,
                 merged_records=len(merged_df),
                 message="Training data created successfully",
             )
@@ -910,32 +1004,51 @@ class FeatureSetService:
         """
         Create an fmap.txt file with feature names and their types.
 
+        The fmap file format is: feature_index<tab>feature_name<tab>feature_type
+        where feature_type is typically 'q' (quantitative) for numeric features.
+
         Args:
-            feature_columns: List of feature column names (excluding product_id)
+            feature_columns: List of feature column names from the training data
             fmap_filename: Name of the fmap file to create
         """
         fmap_path = Path(settings.OUTPUT_DIR) / fmap_filename
 
-        # Filter out non-feature columns (like product_id, keyword, etc.)
+        # feature_columns should already be clean since they were filtered
+        # when building the training data, but we'll be defensive and filter again
+
+        # Define columns that should never be features
+        # Includes both metadata and data leakage columns
+        exclude_columns = {
+            # Metadata
+            "qid",
+            "product_id",
+            "keyword",
+            "relevance_grade",
+            # Data leakage (these were used to create relevance_grade)
+            "total_impressions",
+            "total_clicks",
+            "ctr",
+        }
+
+        # Filter out any excluded columns
         feature_names = [
-            col
-            for col in feature_columns
-            if col
-            not in [
-                "qid",
-                "product_id",
-                "keyword",
-                "total_impressions",
-                "total_clicks",
-                "ctr",
-                "relevance_grade",
-            ]
+            col for col in feature_columns
+            if col not in exclude_columns
         ]
 
-        logger.info(f"Creating fmap file with {len(feature_names)} features")
+        if len(feature_names) == 0:
+            logger.error("No features found for fmap file! Check feature extraction.")
+            raise ValueError("Cannot create fmap file with zero features")
 
+        logger.info(f"Creating fmap file with {len(feature_names)} features")
+        logger.debug(f"Features: {feature_names}")
+
+        # Write fmap file in XGBoost format
         async with aiofiles.open(fmap_path, "w", encoding="utf-8") as f:
             for i, feature_name in enumerate(feature_names):
+                # Format: index<tab>name<tab>type
+                # 'q' = quantitative (numeric feature)
+                # 'i' = indicator (binary feature) - we use 'q' for all
                 await f.write(f"{i}\t{feature_name}\tq\n")
 
-        logger.info(f"Successfully created fmap file: {fmap_filename}")
+        logger.info(f"Successfully created fmap file: {fmap_filename} with {len(feature_names)} features")
